@@ -103,7 +103,7 @@ class TriangularSelfAttentionBlock(nn.Module):
         torch.nn.init.zeros_(self.mlp_pair.mlp[-2].weight)
         torch.nn.init.zeros_(self.mlp_pair.mlp[-2].bias)
 
-    def forward(self, sequence_state, pairwise_state, mask=None, chunk_size=None, **__kwargs):
+    def forward(self, sequence_state, pairwise_state, mask=None, chunk_size=None, profiler=None, **__kwargs):
         """
         Inputs:
           sequence_state: B x L x sequence_state_dim
@@ -128,33 +128,50 @@ class TriangularSelfAttentionBlock(nn.Module):
         assert seq_dim == pairwise_state.shape[2]
 
         # Update sequence state
-        bias = self.pair_to_sequence(pairwise_state)
+        with profiler.profile("bias_pair_to_sequence"):
+            bias = self.pair_to_sequence(pairwise_state)
 
         # Self attention with bias + mlp.
-        y = self.layernorm_1(sequence_state)
-        y, _ = self.seq_attention(y, mask=mask, bias=bias)
-        sequence_state = sequence_state + self.drop(y)
-        sequence_state = self.mlp_seq(sequence_state)
+        with profiler.profile("seq_layernorm"):
+            y = self.layernorm_1(sequence_state)
+
+        with profiler.profile("seq_attention"):
+            y, _ = self.seq_attention(y, mask=mask, bias=bias)
+
+        with profiler.profile("seq_attention_dropout"):
+            sequence_state = sequence_state + self.drop(y)
+
+        with profiler.profile("seq_mlp"):
+            sequence_state = self.mlp_seq(sequence_state)
 
         # Update pairwise state
-        pairwise_state = pairwise_state + self.sequence_to_pair(sequence_state)
+        with profiler.profile("sequence_to_pair"):
+            pairwise_state = pairwise_state + self.sequence_to_pair(sequence_state)
 
         # Axial attention with triangular bias.
         tri_mask = mask.unsqueeze(2) * mask.unsqueeze(1) if mask is not None else None
-        pairwise_state = pairwise_state + self.row_drop(
-            self.tri_mul_out(pairwise_state, mask=tri_mask)
-        )
-        pairwise_state = pairwise_state + self.col_drop(
-            self.tri_mul_in(pairwise_state, mask=tri_mask)
-        )
-        pairwise_state = pairwise_state + self.row_drop(
-            self.tri_att_start(pairwise_state, mask=tri_mask, chunk_size=chunk_size)
-        )
-        pairwise_state = pairwise_state + self.col_drop(
-            self.tri_att_end(pairwise_state, mask=tri_mask, chunk_size=chunk_size)
-        )
+        with profiler.profile("tri_mul_outgoing"):
+            pairwise_state = pairwise_state + self.row_drop(
+                self.tri_mul_out(pairwise_state, mask=tri_mask)
+            )
+
+        with profiler.profile("tri_mul_incoming"):
+            pairwise_state = pairwise_state + self.col_drop(
+                self.tri_mul_in(pairwise_state, mask=tri_mask)
+            )
+
+        with profiler.profile("tri_att_starting"):
+            pairwise_state = pairwise_state + self.row_drop(
+                self.tri_att_start(pairwise_state, mask=tri_mask, chunk_size=chunk_size)
+            )
+
+        with profiler.profile("tri_att_ending"):
+            pairwise_state = pairwise_state + self.col_drop(
+                self.tri_att_end(pairwise_state, mask=tri_mask, chunk_size=chunk_size)
+            )
 
         # MLP over pairs.
-        pairwise_state = self.mlp_pair(pairwise_state)
+        with profiler.profile("pair_mlp"):
+            pairwise_state = self.mlp_pair(pairwise_state)
 
         return sequence_state, pairwise_state

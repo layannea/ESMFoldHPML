@@ -4,13 +4,13 @@
 # LICENSE file in the root directory of this source tree.
 import typing as T
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
 from openfold.model.structure_module import StructureModule
 
-from esm.esmfold.v1.tri_self_attn_block import TriangularSelfAttentionBlock
+from tri_self_attn_block import TriangularSelfAttentionBlock
 
 
 @dataclass
@@ -48,7 +48,8 @@ class FoldingTrunkConfig:
     max_recycles: int = 4
     chunk_size: T.Optional[int] = None
 
-    structure_module: StructureModuleConfig = StructureModuleConfig()
+    #structure_module: StructureModuleConfig = StructureModuleConfig()
+    structure_module: StructureModuleConfig = field(default_factory=StructureModuleConfig)
 
 
 def get_axial_mask(mask):
@@ -154,7 +155,7 @@ class FoldingTrunk(nn.Module):
         # where the chunk_size is the size of the chunks, so 128 would mean to parse 128-lengthed chunks.
         self.chunk_size = chunk_size
 
-    def forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles: T.Optional[int] = None):
+    def forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles: T.Optional[int] = None, profiler=None):
         """
         Inputs:
           seq_feats:     B x L x C            tensor of sequence features
@@ -177,10 +178,12 @@ class FoldingTrunk(nn.Module):
             no_recycles += 1  # First 'recycle' is just the standard forward pass through the model.
 
         def trunk_iter(s, z, residx, mask):
-            z = z + self.pairwise_positional_embedding(residx, mask=mask)
+            with profiler.profile("pairwise_positional_embedding"):
+                z = z + self.pairwise_positional_embedding(residx, mask=mask)
 
-            for block in self.blocks:
-                s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
+            for block_idx, block in enumerate(self.blocks):
+                with profiler.profile(f"trunk_block_{block_idx}"):
+                    s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size, profiler=profiler)
             return s, z
 
         s_s = s_s_0
@@ -193,28 +196,39 @@ class FoldingTrunk(nn.Module):
         for recycle_idx in range(no_recycles):
             with ExitStack() if recycle_idx == no_recycles - 1 else torch.no_grad():
                 # === Recycling ===
-                recycle_s = self.recycle_s_norm(recycle_s.detach())
-                recycle_z = self.recycle_z_norm(recycle_z.detach())
-                recycle_z += self.recycle_disto(recycle_bins.detach())
+                with profiler.profile("recycle_norm_s"):
+                    recycle_s = self.recycle_s_norm(recycle_s.detach())
 
-                s_s, s_z = trunk_iter(s_s_0 + recycle_s, s_z_0 + recycle_z, residx, mask)
+                with profiler.profile("recycle_norm_z"):
+                    recycle_z = self.recycle_z_norm(recycle_z.detach())
+
+                with profiler.profile("recycle_disto_embed"):
+                    recycle_z += self.recycle_disto(recycle_bins.detach())
+
+                with profiler.profile("trunk_iter"):
+                    s_s, s_z = trunk_iter(s_s_0 + recycle_s, s_z_0 + recycle_z, residx, mask)
 
                 # === Structure module ===
-                structure = self.structure_module(
-                    {"single": self.trunk2sm_s(s_s), "pair": self.trunk2sm_z(s_z)},
-                    true_aa,
-                    mask.float(),
-                )
+                with profiler.profile("trunk2sm_projections"):
+                    sm_input = {"single": self.trunk2sm_s(s_s), "pair": self.trunk2sm_z(s_z)}
+
+                with profiler.profile("structure_module"):
+                    structure = self.structure_module(
+                        sm_input,
+                        true_aa,
+                        mask.float(),
+                    )
 
                 recycle_s = s_s
                 recycle_z = s_z
                 # Distogram needs the N, CA, C coordinates, and bin constants same as alphafold.
-                recycle_bins = FoldingTrunk.distogram(
-                    structure["positions"][-1][:, :, :3],
-                    3.375,
-                    21.375,
-                    self.recycle_bins,
-                )
+                with profiler.profile("distogram_calc"):
+                    recycle_bins = FoldingTrunk.distogram(
+                        structure["positions"][-1][:, :, :3],
+                        3.375,
+                        21.375,
+                        self.recycle_bins,
+                    )
 
         assert isinstance(structure, dict)  # type: ignore
         structure["s_s"] = s_s

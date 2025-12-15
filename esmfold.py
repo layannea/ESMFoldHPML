@@ -19,7 +19,7 @@ from esm.esmfold.v1.misc import (
     collate_dense_tensors,
     output_to_pdb,
 )
-from esm.esmfold.v1.trunk import FoldingTrunk, FoldingTrunkConfig
+from trunk import FoldingTrunk, FoldingTrunkConfig
 from openfold.data.data_transforms import make_atom14_masks
 from openfold.np import residue_constants
 from openfold.utils.loss import compute_predicted_aligned_error, compute_tm
@@ -243,7 +243,7 @@ class ESMFold(nn.Module):
 
             with self.profiler.profile("folding_trunk_total"):
                 structure: dict = self.trunk(
-                    s_s_0, s_z_0, aa, residx, mask, no_recycles=num_recycles,
+                    s_s_0, s_z_0, aa, residx, mask, no_recycles=num_recycles, profiler=self.profiler,
                 )
                 # Documenting what we expect:
                 structure = {
