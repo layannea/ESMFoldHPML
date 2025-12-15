@@ -23,6 +23,7 @@ from esm.esmfold.v1.trunk import FoldingTrunk, FoldingTrunkConfig
 from openfold.data.data_transforms import make_atom14_masks
 from openfold.np import residue_constants
 from openfold.utils.loss import compute_predicted_aligned_error, compute_tm
+from profiler import Profiler
 
 
 @dataclass
@@ -104,6 +105,8 @@ class ESMFold(nn.Module):
             nn.Linear(cfg.lddt_head_hid_dim, 37 * self.lddt_bins),
         )
 
+        self.profiler = Profiler(enabled=True)
+
     @staticmethod
     def _af2_to_esm(d: Alphabet):
         # Remember that t is shifted from residue_constants by 1 (0 is padding).
@@ -172,140 +175,147 @@ class ESMFold(nn.Module):
             num_recycles (int): How many recycle iterations to perform. If None, defaults to training max
                 recycles, which is 3.
         """
-        if mask is None:
-            mask = torch.ones_like(aa)
+        self.profiler.reset()
 
-        B = aa.shape[0]
-        L = aa.shape[1]
-        device = aa.device
+        with self.profiler.profile("total_forward"):
+            if mask is None:
+                mask = torch.ones_like(aa)
 
-        if residx is None:
-            residx = torch.arange(L, device=device).expand_as(aa)
+            B = aa.shape[0]
+            L = aa.shape[1]
+            device = aa.device
 
-        ############################## 
-        ## ESM (ENCODING WITH ESM2) ##
-        ##############################
+            if residx is None:
+                residx = torch.arange(L, device=device).expand_as(aa)
 
-        esmaa = self._af2_idx_to_esm_idx(aa, mask)
+            ##############################
+            ## ESM (ENCODING WITH ESM2) ##
+            ##############################
 
-        if masking_pattern is not None:
-            esmaa = self._mask_inputs_to_esm(esmaa, masking_pattern)
+            esmaa = self._af2_idx_to_esm_idx(aa, mask)
 
-        esm_s, esm_z = self._compute_language_model_representations(esmaa) 
-        ## esm_s are the sequence representations from each layer of ESM2
-        ## esm_z are the pairwise attention maps from ESM2
+            if masking_pattern is not None:
+                esmaa = self._mask_inputs_to_esm(esmaa, masking_pattern)
 
-        # Convert esm_s to the precision used by the trunk and
-        # the structure module. These tensors may be a lower precision if, for example,
-        # we're running the language model in fp16 precision.
+            with self.profiler.profile("esm2_encoding"):
+                esm_s, esm_z = self._compute_language_model_representations(esmaa)
+                ## esm_s are the sequence representations from each layer of ESM2
+                ## esm_z are the pairwise attention maps from ESM2
 
-        esm_s = esm_s.to(self.esm_s_combine.dtype)
-        esm_s = esm_s.detach()
+                # Convert esm_s to the precision used by the trunk and
+                # the structure module. These tensors may be a lower precision if, for example,
+                # we're running the language model in fp16 precision.
 
-        ###################################################################
+                esm_s = esm_s.to(self.esm_s_combine.dtype)
+                esm_s = esm_s.detach()
 
-        ########################################################
-        ## PREPROCESSING FOR SEQUENCE/PAIRWISE REPRESENTATION ##
-        ########################################################
+            ###################################################################
 
-        ## Here we prep the sequence representations by combining each layer into a weighted combination (1)
-        ## This then gets transformed into the folding trunk's dimensions via MLP #(2)
-        ## Then gets added to amino acid embeddings #(3)
+            ########################################################
+            ## PREPROCESSING FOR SEQUENCE/PAIRWISE REPRESENTATION ##
+            ########################################################
 
-        ## For the pairwise attention maps, they also get projected into the folding trunk's dimensions via MLP (4)
-        
-        esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2) #(1)
-        s_s_0 = self.esm_s_mlp(esm_s) #(2)
-        if self.cfg.use_esm_attn_map:
-            esm_z = esm_z.to(self.esm_s_combine.dtype) 
-            esm_z = esm_z.detach()
-            s_z_0 = self.esm_z_mlp(esm_z) #(4)
-        else:
-            s_z_0 = s_s_0.new_zeros(B, L, L, self.cfg.trunk.pairwise_state_dim) ## if no attention maps then initialize to 0
-            
-        s_s_0 += self.embedding(aa) #(3)
+            ## Here we prep the sequence representations by combining each layer into a weighted combination (1)
+            ## This then gets transformed into the folding trunk's dimensions via MLP #(2)
+            ## Then gets added to amino acid embeddings #(3)
 
-        ###################################################################
+            ## For the pairwise attention maps, they also get projected into the folding trunk's dimensions via MLP (4)
 
-        ##############################
-        ## FOLDING TRUNK PROCESSING ##
-        ##############################
+            with self.profiler.profile("esm_preprocessing"):
+                esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2) #(1)
+                s_s_0 = self.esm_s_mlp(esm_s) #(2)
+                if self.cfg.use_esm_attn_map:
+                    esm_z = esm_z.to(self.esm_s_combine.dtype)
+                    esm_z = esm_z.detach()
+                    s_z_0 = self.esm_z_mlp(esm_z) #(4)
+                else:
+                    s_z_0 = s_s_0.new_zeros(B, L, L, self.cfg.trunk.pairwise_state_dim) ## if no attention maps then initialize to 0
 
-        ## This is where the sequence and pairwise representations get used to make the final structure predictions
+                s_s_0 += self.embedding(aa) #(3)
 
-        structure: dict = self.trunk(
-            s_s_0, s_z_0, aa, residx, mask, no_recycles=num_recycles
-        )
-        # Documenting what we expect:
-        structure = {
-            k: v
-            for k, v in structure.items()
-            if k
-            in [
-                "s_z",
-                "s_s",
-                "frames",
-                "sidechain_frames",
-                "unnormalized_angles",
-                "angles",
-                "positions",
-                "states",
-            ]
-        }
+            ###################################################################
 
-        ###################################################################
+            ##############################
+            ## FOLDING TRUNK PROCESSING ##
+            ##############################
 
-        #########################################################
-        ## PREDICTION HEADS (DISTOGRAM, LANGUAGE MODEL, plDDT) ##
-        #########################################################
+            ## This is where the sequence and pairwise representations get used to make the final structure predictions
 
-        disto_logits = self.distogram_head(structure["s_z"])
-        disto_logits = (disto_logits + disto_logits.transpose(1, 2)) / 2
-        structure["distogram_logits"] = disto_logits
-
-        lm_logits = self.lm_head(structure["s_s"])
-        structure["lm_logits"] = lm_logits
-
-        structure["aatype"] = aa
-        make_atom14_masks(structure)
-
-        for k in [
-            "atom14_atom_exists",
-            "atom37_atom_exists",
-        ]:
-            structure[k] *= mask.unsqueeze(-1)
-        structure["residue_index"] = residx
-
-        lddt_head = self.lddt_head(structure["states"]).reshape(
-            structure["states"].shape[0], B, L, -1, self.lddt_bins
-        )
-        structure["lddt_head"] = lddt_head
-        plddt = categorical_lddt(lddt_head[-1], bins=self.lddt_bins)
-        structure["plddt"] = (
-            100 * plddt
-        )  # we predict plDDT between 0 and 1, scale to be between 0 and 100.
-
-        ptm_logits = self.ptm_head(structure["s_z"])
-
-        seqlen = mask.type(torch.int64).sum(1)
-        structure["ptm_logits"] = ptm_logits
-        structure["ptm"] = torch.stack(
-            [
-                compute_tm(
-                    batch_ptm_logits[None, :sl, :sl],
-                    max_bins=31,
-                    no_bins=self.distogram_bins,
+            with self.profiler.profile("folding_trunk_total"):
+                structure: dict = self.trunk(
+                    s_s_0, s_z_0, aa, residx, mask, no_recycles=num_recycles,
                 )
-                for batch_ptm_logits, sl in zip(ptm_logits, seqlen)
-            ]
-        )
-        structure.update(
-            compute_predicted_aligned_error(
-                ptm_logits, max_bin=31, no_bins=self.distogram_bins
-            )
-        )
+                # Documenting what we expect:
+                structure = {
+                    k: v
+                    for k, v in structure.items()
+                    if k
+                    in [
+                        "s_z",
+                        "s_s",
+                        "frames",
+                        "sidechain_frames",
+                        "unnormalized_angles",
+                        "angles",
+                        "positions",
+                        "states",
+                    ]
+                }
 
-        return structure
+            ###################################################################
+
+            #########################################################
+            ## PREDICTION HEADS (DISTOGRAM, LANGUAGE MODEL, plDDT) ##
+            #########################################################
+
+            with self.profiler.profile("prediction_heads"):
+                disto_logits = self.distogram_head(structure["s_z"])
+                disto_logits = (disto_logits + disto_logits.transpose(1, 2)) / 2
+                structure["distogram_logits"] = disto_logits
+
+                lm_logits = self.lm_head(structure["s_s"])
+                structure["lm_logits"] = lm_logits
+
+                structure["aatype"] = aa
+                make_atom14_masks(structure)
+
+                for k in [
+                    "atom14_atom_exists",
+                    "atom37_atom_exists",
+                ]:
+                    structure[k] *= mask.unsqueeze(-1)
+                structure["residue_index"] = residx
+
+                lddt_head = self.lddt_head(structure["states"]).reshape(
+                    structure["states"].shape[0], B, L, -1, self.lddt_bins
+                )
+                structure["lddt_head"] = lddt_head
+                plddt = categorical_lddt(lddt_head[-1], bins=self.lddt_bins)
+                structure["plddt"] = (
+                    100 * plddt
+                )  # we predict plDDT between 0 and 1, scale to be between 0 and 100.
+
+                ptm_logits = self.ptm_head(structure["s_z"])
+
+                seqlen = mask.type(torch.int64).sum(1)
+                structure["ptm_logits"] = ptm_logits
+                structure["ptm"] = torch.stack(
+                    [
+                        compute_tm(
+                            batch_ptm_logits[None, :sl, :sl],
+                            max_bins=31,
+                            no_bins=self.distogram_bins,
+                        )
+                        for batch_ptm_logits, sl in zip(ptm_logits, seqlen)
+                    ]
+                )
+                structure.update(
+                    compute_predicted_aligned_error(
+                        ptm_logits, max_bin=31, no_bins=self.distogram_bins
+                    )
+                )
+
+            return structure
 
     @torch.no_grad()
     def infer(
@@ -392,3 +402,4 @@ class ESMFold(nn.Module):
     @property
     def device(self):
         return self.esm_s_combine.device
+
