@@ -1,0 +1,21 @@
+# Test directories
+test_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Weights & Biases
+wandb/
+
+# Model files
+*.model
+
+# Data files
+casp14_targets/
+TMalign
