@@ -178,24 +178,25 @@ class ESMFold(nn.Module):
         self.profiler.reset()
 
         with self.profiler.profile("total_forward"):
-            if mask is None:
-                mask = torch.ones_like(aa)
+            with self.profiler.profile("input_prep"):
+                if mask is None:
+                    mask = torch.ones_like(aa)
 
-            B = aa.shape[0]
-            L = aa.shape[1]
-            device = aa.device
+                B = aa.shape[0]
+                L = aa.shape[1]
+                device = aa.device
 
-            if residx is None:
-                residx = torch.arange(L, device=device).expand_as(aa)
+                if residx is None:
+                    residx = torch.arange(L, device=device).expand_as(aa)
 
-            ##############################
-            ## ESM (ENCODING WITH ESM2) ##
-            ##############################
+                ##############################
+                ## ESM (ENCODING WITH ESM2) ##
+                ##############################
 
-            esmaa = self._af2_idx_to_esm_idx(aa, mask)
+                esmaa = self._af2_idx_to_esm_idx(aa, mask)
 
-            if masking_pattern is not None:
-                esmaa = self._mask_inputs_to_esm(esmaa, masking_pattern)
+                if masking_pattern is not None:
+                    esmaa = self._mask_inputs_to_esm(esmaa, masking_pattern)
 
             with self.profiler.profile("esm2_encoding"):
                 esm_s, esm_z = self._compute_language_model_representations(esmaa)
