@@ -19,11 +19,11 @@ The profiling is done on wandb, and the experiments should update their results 
 Link: https://wandb.ai/sun-stones-columbia-university/esmfold-experiments?nw=nwusersunstones
 
 ## Results
-[Alt text](.assets/graph1.png)
+![Alt text](.assets/graph1.png)
 Runtime breakdown for baseline forward pass.
 
-[Alt text](.assets/cpucuda.png)
+![Alt text](.assets/cpucuda.png)
 Comparing stages of the forward pass in CPU and GPU time.
 
-[Alt text](.assets/comp.png)
+![Alt text](.assets/comp.png)
 Comparing the percent runtimes between a short and long protein sequence.
