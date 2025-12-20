@@ -16,7 +16,7 @@ Then to replicate any of our experiments, simply run one of the following notebo
 ## Profiling
 
 The profiling is done on wandb, and the experiments should update their results automatically on the wandb website. Additionally, a summary of key metrics is saved in the model.profiler class, and can be used to analyze the data locally.
-Link: https://wandb.ai/sun-stones-columbia-university/esmfold-experiments?nw=nwusersunstones
+Link: https://wandb.ai/sun-stones-columbia-university/esmfold-experiments?nw=nwusersunstones. If link doesn't work, we have uploaded a copy to the report with all the graphs here as wandb_report.pdf
 
 ## Results
 ![Alt text](.assets/graph1.png)
